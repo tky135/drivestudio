@@ -207,6 +207,36 @@ class MultiTrainer(BasicTrainer):
 
         Returns:
             Dict[str, torch.Tensor]: output of the model
+            
+        image_infos: {
+            'origins': torch.Tensor, [900 / d, 1600 / d, 3]. 都是同一个origin
+            'viewdirs': torch.Tensor, [900 / d, 1600 / d, 3]. 
+            'direction_norm': torch.Tensor, [900 / d, 1600 / d, 1]. ???
+            'pixel_coords': torch.Tensor, [900 / d, 1600 / d, 2]. normalized pixel coordinates
+            'normed_time': torch.Tensor, [900 / d, 1600 / d]. normalized time. 猜测是整个bag的时间戳在0-1之间的归一化
+            'img_idx': torch.Tensor, [900 / d, 1600 / d]. 
+            'frame_idx': torch.Tensor, [900 / d, 1600 / d].
+            'pixels': torch.Tensor, [900 / d, 1600 / d, 3]. RGB
+            'sky_masks': torch.Tensor, [900 / d, 1600 / d]. 估计1代表天空
+            'dynamic_masks': torch.Tensor, [900 / d, 1600 / d]. 
+            'human_masks': torch.Tensor, [900 / d, 1600 / d].
+            'vehicle_masks': torch.Tensor, [900 / d, 1600 / d].
+            'lidar_depth_map': torch.Tensor, [900 / d, 1600 / d].
+        }
+        
+        camera_infos: {
+            'cam_id': torch.Tensor, [900 / d, 1600 / d].
+            'cam_name': str.
+            'camera_to_world': torch.Tensor, [4, 4]. #TODO: nuscenes相机高度从哪里来
+            'height': torch.Tensor, [1]. image height
+            'width': torch.Tensor, [1]. image width
+            'intrinsics': torch.Tensor, [3, 3].
+        }
+        
+        
+        self.models: dict_keys(['Background', 'RigidNodes', 'DeformableNodes', 'SMPLNodes', 'Sky', 'Affine', 'CamPose'])
+
+        self.gaussian_classes: dict_keys(['Background', 'RigidNodes', 'SMPLNodes', 'DeformableNodes'])
         """
 
         # set current time or use temporal smoothing
@@ -227,17 +257,22 @@ class MultiTrainer(BasicTrainer):
                 model.set_cur_frame(self.cur_frame)
         
         # prapare data
-        processed_cam = self.process_camera(
+        processed_cam = self.process_camera(    # 如果要对pose优化，或者perturb（TODO 为什么），在这里处理
             camera_infos=camera_infos,
             image_ids=image_infos["img_idx"].flatten()[0],
             novel_view=novel_view
         )
-        gs = self.collect_gaussians(
+        gs = self.collect_gaussians(    # 从各个gaussian model中收集gaussian，每个gaussian model都有get_gaussians接口，根据相机参数获得gaussian
             cam=processed_cam,
             image_ids=image_infos["img_idx"].flatten()[0]
-        )
+        ) # gs: dataclass_gs(_means, _scales, _quats, _rgbs, _opacities)
+        
 
         # render gaussians
+        # outputs: 
+        #   rgb_gaussians: torch.Tensor, [900 / d, 1600 / d, 3]. 
+        #   depth: torch.Tensor, [900 / d, 1600 / d, 1].
+        #   opacity: torch.Tensor, [900 / d, 1600 / d, 1].
         outputs, render_fn = self.render_gaussians(
             gs=gs,
             cam=processed_cam,
@@ -252,7 +287,7 @@ class MultiTrainer(BasicTrainer):
         outputs["rgb_sky"] = sky_model(image_infos)
         outputs["rgb_sky_blend"] = outputs["rgb_sky"] * (1.0 - outputs["opacity"])
         
-        # affine transformation
+        # affine transformation # 对每个image_idx的rgb进行一次affine transform
         outputs["rgb"] = self.affine_transformation(
             outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]), image_infos
         )

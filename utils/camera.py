@@ -3,7 +3,7 @@ import os
 import torch
 import numpy as np
 from typing import Dict
-
+import pytorch3d as p3d
 from scipy.spatial.transform import Slerp
 from scipy.spatial.transform import Rotation as R
 
@@ -65,6 +65,8 @@ def get_interp_novel_trajectories(
     original_frames = per_cam_poses[list(per_cam_poses.keys())[0]].shape[0]
     
     trajectory_generators = {
+        "keep_rotating": keep_rotating,
+        "same": same,
         "front_center_interp": front_center_interp,
         "s_curve": s_curve,
         "three_key_poses": three_key_poses_trajectory
@@ -74,6 +76,31 @@ def get_interp_novel_trajectories(
         raise ValueError(f"Unknown trajectory type: {traj_type}")
     
     return trajectory_generators[traj_type](dataset_type, per_cam_poses, original_frames, target_frames)
+
+def same(
+    dataset_type: str, per_cam_poses: Dict[int, torch.Tensor], original_frames: int, target_frames: int
+) -> torch.Tensor:
+    """Generate a trajectory with the same poses as the original."""
+    assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required for same"
+    return interpolate_poses(per_cam_poses[0], target_frames)
+def keep_rotating(
+    dataset_type: str, per_cam_poses: Dict[int, torch.Tensor], original_frames: int, target_frames: int
+) -> torch.Tensor:
+    assert 0 in per_cam_poses.keys(), "Front center camera (ID 0) is required for same"
+    import ipdb; ipdb.set_trace()
+    rotation_angles = torch.arange(0, 4 * torch.pi, 4 * torch.pi / target_frames)
+    rotation_angles = torch.hstack(torch.zeros_like(rotation_angles), torch.zeros_like(rotation_angles), rotation_angles)
+    rotation_matrices = p3d.transforms.euler_angles_to_matrix(rotation_angles, "XYZ")
+    rotation_matrices_4x4 = torch.eye(4, device=rotation_matrices.device)
+    rotation_matrices_4x4[:3, :3] = rotation_matrices
+    
+    
+    same_poses = interpolate_poses(per_cam_poses[0], target_frames)
+
+    return torch.matmul(same_poses, rotation_matrices_4x4)
+
+
+    
 
 def front_center_interp(
     dataset_type: str, per_cam_poses: Dict[int, torch.Tensor], original_frames: int, target_frames: int, num_loops: int = 1
