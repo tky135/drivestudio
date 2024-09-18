@@ -273,9 +273,6 @@ def main(args):
         
         # after training step
         trainer.postprocess_per_train_step(step=step)
-        # torch.cuda.empty_cache()
-        if step % 1000 == 0:
-            trainer.validate_mesh()
         
         #----------------------------------------------------------------------------
         #-------------------------------  logging  ----------------------------------
