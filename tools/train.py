@@ -108,6 +108,7 @@ def main(args):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # build dataset
+    # cfg.data: # dict_keys(['data_root', 'dataset', 'scene_idx', 'start_timestep', 'end_timestep', 'preload_device', 'pixel_source', 'lidar_source'])
     dataset = DrivingDataset(data_cfg=cfg.data)
 
     # setup trainer
@@ -187,53 +188,53 @@ def main(args):
     for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
         #----------------------------------------------------------------------------
         #----------------------------     Validate     ------------------------------
-        if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:
-            logger.info("Visualizing...")
-            vis_timestep = np.linspace(
-                0,
-                dataset.num_img_timesteps,
-                trainer.num_iters // cfg.logging.vis_freq + 1,
-                endpoint=False,
-                dtype=int,
-            )[step // cfg.logging.vis_freq]
-            with torch.no_grad():
-                render_results = render_images(
-                    trainer=trainer,
-                    dataset=dataset.full_image_set,
-                    compute_metrics=True,
-                    compute_error_map=cfg.render.vis_error,
-                    vis_indices=[
-                        vis_timestep * dataset.pixel_source.num_cams + i
-                        for i in range(dataset.pixel_source.num_cams)
-                    ],
-                )
-            if args.enable_wandb:
-                wandb.log(
-                    {
-                        "image_metrics/psnr": render_results["psnr"],
-                        "image_metrics/ssim": render_results["ssim"],
-                        "image_metrics/occupied_psnr": render_results["occupied_psnr"],
-                        "image_metrics/occupied_ssim": render_results["occupied_ssim"],
-                    }
-                )
-            vis_frame_dict = save_videos(
-                render_results,
-                save_pth=os.path.join(
-                    cfg.log_dir, "images", f"step_{step}.png"
-                ),  # don't save the video
-                layout=dataset.layout,
-                num_timestamps=1,
-                keys=render_keys,
-                save_seperate_video=cfg.logging.save_seperate_video,
-                num_cams=dataset.pixel_source.num_cams,
-                fps=cfg.render.fps,
-                verbose=False,
-            )
-            if args.enable_wandb:
-                for k, v in vis_frame_dict.items():
-                    wandb.log({"image_rendering/" + k: wandb.Image(v)})
-            del render_results
-            torch.cuda.empty_cache()
+        # if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:
+        #     logger.info("Visualizing...")
+        #     vis_timestep = np.linspace(
+        #         0,
+        #         dataset.num_img_timesteps,
+        #         trainer.num_iters // cfg.logging.vis_freq + 1,
+        #         endpoint=False,
+        #         dtype=int,
+        #     )[step // cfg.logging.vis_freq]
+        #     # with torch.no_grad():
+        #     render_results = render_images(
+        #         trainer=trainer,
+        #         dataset=dataset.full_image_set,
+        #         compute_metrics=True,
+        #         compute_error_map=cfg.render.vis_error,
+        #         vis_indices=[
+        #             vis_timestep * dataset.pixel_source.num_cams + i
+        #             for i in range(dataset.pixel_source.num_cams)
+        #         ],
+        #     )
+        #     if args.enable_wandb:
+        #         wandb.log(
+        #             {
+        #                 "image_metrics/psnr": render_results["psnr"],
+        #                 "image_metrics/ssim": render_results["ssim"],
+        #                 "image_metrics/occupied_psnr": render_results["occupied_psnr"],
+        #                 "image_metrics/occupied_ssim": render_results["occupied_ssim"],
+        #             }
+        #         )
+        #     vis_frame_dict = save_videos(
+        #         render_results,
+        #         save_pth=os.path.join(
+        #             cfg.log_dir, "images", f"step_{step}.png"
+        #         ),  # don't save the video
+        #         layout=dataset.layout,
+        #         num_timestamps=1,
+        #         keys=render_keys,
+        #         save_seperate_video=cfg.logging.save_seperate_video,
+        #         num_cams=dataset.pixel_source.num_cams,
+        #         fps=cfg.render.fps,
+        #         verbose=False,
+        #     )
+        #     if args.enable_wandb:
+        #         for k, v in vis_frame_dict.items():
+        #             wandb.log({"image_rendering/" + k: wandb.Image(v)})
+        #     del render_results
+        #     torch.cuda.empty_cache()
                 
         
         #----------------------------------------------------------------------------
@@ -272,6 +273,9 @@ def main(args):
         
         # after training step
         trainer.postprocess_per_train_step(step=step)
+        # torch.cuda.empty_cache()
+        if step % 1000 == 0:
+            trainer.validate_mesh()
         
         #----------------------------------------------------------------------------
         #-------------------------------  logging  ----------------------------------
@@ -302,35 +306,35 @@ def main(args):
         
         #----------------------------------------------------------------------------
         #------------------------    Cache Image Error    ---------------------------
-        if (
-            step > 0 and trainer.optim_general.cache_buffer_freq > 0
-            and step % trainer.optim_general.cache_buffer_freq == 0
-        ):
-            logger.info("Caching image error...")
-            trainer.set_eval()
-            with torch.no_grad():
-                dataset.pixel_source.update_downscale_factor(
-                    1 / dataset.pixel_source.buffer_downscale
-                )
-                render_results = render_images(
-                    trainer=trainer,
-                    dataset=dataset.full_image_set,
-                )
-                dataset.pixel_source.reset_downscale_factor()
-                dataset.pixel_source.update_image_error_maps(render_results)
+        # if (
+        #     step > 0 and trainer.optim_general.cache_buffer_freq > 0
+        #     and step % trainer.optim_general.cache_buffer_freq == 0
+        # ):
+        #     logger.info("Caching image error...")
+        #     trainer.set_eval()
+        #     with torch.no_grad():
+        #         dataset.pixel_source.update_downscale_factor(
+        #             1 / dataset.pixel_source.buffer_downscale
+        #         )
+        #         render_results = render_images(
+        #             trainer=trainer,
+        #             dataset=dataset.full_image_set,
+        #         )
+        #         dataset.pixel_source.reset_downscale_factor()
+        #         dataset.pixel_source.update_image_error_maps(render_results)
 
-                # save error maps
-                merged_error_video = dataset.pixel_source.get_image_error_video(
-                    dataset.layout
-                )
-                imageio.mimsave(
-                    os.path.join(
-                        cfg.log_dir, "buffer_maps", f"buffer_maps_{step}.mp4"
-                    ),
-                    merged_error_video,
-                    fps=cfg.render.fps,
-                )
-            logger.info("Done caching rgb error maps")
+        #         # save error maps
+        #         merged_error_video = dataset.pixel_source.get_image_error_video(
+        #             dataset.layout
+        #         )
+        #         imageio.mimsave(
+        #             os.path.join(
+        #                 cfg.log_dir, "buffer_maps", f"buffer_maps_{step}.mp4"
+        #             ),
+        #             merged_error_video,
+        #             fps=cfg.render.fps,
+        #         )
+        #     logger.info("Done caching rgb error maps")
             
     
     logger.info("Training done!")

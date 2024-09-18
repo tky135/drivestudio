@@ -152,6 +152,10 @@ class NuScenesCameraData(CameraData):
         return torch.from_numpy(np.stack(cam_to_worlds, axis=0)).float()
     
 class NuScenesPixelSource(ScenePixelSource):
+    """
+    接口：self.camera_data: Dict[int, NuScenesCameraData]，NuScenesCameraData有接口: get_camera2worlds
+    
+    """
     def __init__(
         self,
         dataset_name: str,
@@ -165,11 +169,11 @@ class NuScenesPixelSource(ScenePixelSource):
         self.data_path = data_path
         self.start_timestep = start_timestep
         self.end_timestep = end_timestep
-        self.load_data()
+        self.load_data()    # 会调用load_cameras和load_objects
         
     def load_cameras(self):
         self._timesteps = torch.arange(self.start_timestep, self.end_timestep)
-        self.register_normalized_timestamps()
+        self.register_normalized_timestamps()   # 获得self._normalized_time
         
         for idx, cam_id in enumerate(self.camera_list):
             logger.info(f"Loading camera {cam_id}")

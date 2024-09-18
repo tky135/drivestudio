@@ -45,10 +45,10 @@ class DrivingDataset(SceneDataset):
         #   ArgoVerse:7 Cameras
         #   PandaSet: 6 Cameras
         #   NuPlan:   8 Cameras
-        self.type = self.data_cfg.dataset
+        self.type = self.data_cfg.dataset   # 'nuscenes'
         try: # For Waymo, NuScenes, ArgoVerse, PandaSet
             self.data_path = os.path.join(
-                self.data_cfg.data_root,
+                self.data_cfg.data_root,    # 'data/nuscenes/processed_10Hz/mini'
                 f"{int(self.scene_idx):03d}"
             )
         except: # For KITTI, NuPlan
@@ -72,10 +72,15 @@ class DrivingDataset(SceneDataset):
         self.start_timestep = self.data_cfg.start_timestep
         
         # ---- create layout for visualization ---- #
-        self.layout = get_layout(self.type)
+        self.layout = get_layout(self.type) # return一个函数，用于多个视角的可视化
 
         # ---- create data source ---- #
         self.pixel_source, self.lidar_source = self.build_data_source()
+        # 接口：
+        # self.pixel_source.camera_data[0].get_image(0)
+        # self.pixel_source.camera_data[0].images
+        # self.pixel_source.camera_data[0].cam_to_worlds
+        # self.pixel_source.camera_data[0].intrinsics
         assert self.pixel_source is not None and self.lidar_source is not None, \
             "Must have both pixel source and lidar source"
         self.project_lidar_pts_on_images(
@@ -94,7 +99,7 @@ class DrivingDataset(SceneDataset):
 
         # ---- create split wrappers ---- #
         image_sets = self.build_split_wrapper()
-        self.train_image_set, self.test_image_set, self.full_image_set = image_sets
+        self.train_image_set, self.test_image_set, self.full_image_set = image_sets # 给train.py 的接口
         
         # debug use
         # self.seg_dynamic_instances_in_lidar_frame(-1, frame_idx=0)
@@ -145,7 +150,7 @@ class DrivingDataset(SceneDataset):
         Create the data source for the dataset.
         """
         # ---- create pixel source ---- #
-        pixel_source = import_str(self.data_cfg.pixel_source.type)(
+        pixel_source = import_str(self.data_cfg.pixel_source.type)( # 'datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource'
             self.data_cfg.dataset,
             self.data_cfg.pixel_source,
             self.data_path,
@@ -158,7 +163,7 @@ class DrivingDataset(SceneDataset):
         # ---- create lidar source ---- #
         lidar_source = None
         if self.data_cfg.lidar_source.load_lidar:
-            lidar_source = import_str(self.data_cfg.lidar_source.type)(
+            lidar_source = import_str(self.data_cfg.lidar_source.type)( # 'datasets.nuscenes.nuscenes_sourceloader.NuScenesLiDARSource'
                 self.data_cfg.lidar_source,
                 self.data_path,
                 self.start_timestep,

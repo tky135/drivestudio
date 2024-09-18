@@ -35,11 +35,10 @@ class MultiTrainer(BasicTrainer):
            
         for class_name, model_cfg in self.model_config.items():
             # update model config for gaussian classes
-            if class_name in self.gaussian_classes:
+            if class_name in self.gaussian_classes.keys():
                 model_cfg = self.model_config.pop(class_name)
                 self.model_config[class_name] = self.update_gaussian_cfg(model_cfg)
                 
-            if class_name in self.gaussian_classes.keys():
                 model = import_str(model_cfg.type)(
                     **model_cfg,
                     class_name=class_name,
@@ -49,14 +48,17 @@ class MultiTrainer(BasicTrainer):
                     device=self.device
                 )
                 
-            if class_name in self.misc_classes_keys:
+            elif class_name in self.misc_classes_keys:
                 model = import_str(model_cfg.type)(
                     class_name=class_name,
                     **model_cfg.get('params', {}),
                     n=self.num_full_images,
                     device=self.device
                 ).to(self.device)
-
+            elif class_name == 'Ground':
+                model = import_str(model_cfg.type)().to(self.device)
+            else:
+                raise Exception("Not supported class name: {}".format(class_name))
             self.models[class_name] = model
             
         logger.info(f"Initialized models: {self.models.keys()}")
@@ -87,6 +89,18 @@ class MultiTrainer(BasicTrainer):
         self,
         dataset: DrivingDataset,
     ) -> None:
+
+        # Ground network initialization
+        self.omnire_w2neus_w = self.models['Ground'].omnire_w2neus_w.to(dataset.pixel_source.camera_data[0].cam_to_worlds.device)
+        self.cam_0_to_neus_world = self.omnire_w2neus_w @ dataset.pixel_source.camera_data[0].cam_to_worlds
+        self.ego_points = self.cam_0_to_neus_world[:, :3, 3]
+        self.ego_points[:, 2] -= 1.51
+        self.ego_normals = self.cam_0_to_neus_world[:, :3, :3] @ torch.tensor([0, -1, 0]).type(torch.float32).to(self.cam_0_to_neus_world.device)
+        self.models['Ground'].ego_points = self.ego_points
+        self.models['Ground'].ego_normals = self.ego_normals
+        self.models['Ground'].pretrain_sdf()
+        
+        self.models['Ground'].validate_mesh()
         # get instance points
         rigidnode_pts_dict, deformnode_pts_dict, smplnode_pts_dict = {}, {}, {}
         if "RigidNodes" in self.model_config:
@@ -281,6 +295,11 @@ class MultiTrainer(BasicTrainer):
             render_mode="RGB+ED",
             radius_clip=self.render_cfg.get('radius_clip', 0.)
         )
+        
+        # render ground
+        ground_model = self.models['Ground']
+        rgb_ground = ground_model(image_infos, camera_infos)
+        outputs['ground'] = rgb_ground
         
         # render sky
         sky_model = self.models['Sky']

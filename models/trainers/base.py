@@ -523,7 +523,11 @@ class BasicTrainer(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         # calculate loss
         loss_dict = {}
-        
+        ground_loss = self.models['Ground'].get_loss(outputs['ground'], image_infos, cam_infos)
+        print("Ground loss", ground_loss)
+        loss_dict.update({
+            "ground_loss": ground_loss
+        })
         if "egocar_masks" in image_infos:
             # in the case of egocar, we need to mask out the egocar region
             valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float()

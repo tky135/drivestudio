@@ -668,3 +668,536 @@ class VoxelDeformer(nn.Module):
             sums = weights.sum(1, keepdim=True)
             weights = weights / sums
         return weights.detach()
+
+def nn_2d_k(A, B, k=1):
+    """
+    A: (N, 2)
+    B: (M, 2) query points
+    return: (M) indices of the nearest neighbors in A
+    """
+    A = A.unsqueeze(0)
+    B = B.unsqueeze(1)
+    distances = torch.norm(A - B, dim=-1)
+    nn_dist, nn_idx = torch.topk(distances, k, dim=-1, largest=False) #[M, k], [M, k]
+    return nn_dist, nn_idx
+
+
+from .fields import SDFNetwork_2d_hash, SingleVarianceNetwork, RenderingNetwork, LabelNetwork
+from .renderer import NeuSRenderer
+import numpy as np
+from scipy.spatial import cKDTree
+from tqdm import tqdm
+import os
+import open3d as o3d
+import cv2
+idx2color = [[157, 234, 50], [211, 211, 202], [233, 74, 127], [85, 37, 136], [250, 220, 2], [157, 234, 50]]
+
+class Ground(nn.Module):
+    def __init__(self):
+        super(Ground, self).__init__()
+        # initialize everything model
+        
+        self.device = torch.device('cuda')
+        
+        
+        # confs
+        self.end_iter = 1000000
+        self.max_iter = 50000
+        self.save_freq = 10000
+        self.report_freq = 1000
+        self.val_freq = 1000
+        self.val_mesh_freq = 10000
+        self.batch_size = 1024
+        self.validate_resolution_level = 4
+        self.learning_rate = 5e-4
+        self.learning_rate_alpha = 0.05
+        self.use_white_bkgd = False
+        self.warm_up_end = 1000
+        self.anneal_end = 50000
+        
+        
+        # models
+        self.igr_weight = 5.0
+        self.mask_weight = 0.1
+        self.ssim_weight = 0.0
+        self.sdf_network = SDFNetwork_2d_hash(**{'d_out': 257, 'd_in': 2, 'd_hidden': 256, 'n_layers': 8, 'skip_in': [4], 'multires': 6, 'bias': 0.5, 'scale': 10.0, 'geometric_init': True, 'weight_norm': True}, base_resolution=256, num_clusters=1).to(self.device)
+        self.deviation_network = SingleVarianceNetwork(**{'init_val': 0.3}).to(self.device)
+        self.color_network = RenderingNetwork(**{'d_feature': 64, 'mode': 'xy_embed', 'd_in': 9, 'd_out': 3, 'd_hidden': 256, 'n_layers': 4, 'weight_norm': True, 'multires_view': 4, 'squeeze_out': True}, n_camera=6).to(self.device)
+        self.label_network = LabelNetwork(**{'d_feature': 64, 'd_in': 2, 'd_out': 5, 'd_hidden': 256, 'n_layers': 4}).to(self.device)
+        self.renderer = NeuSRenderer(None,
+                                     self.sdf_network,
+                                     self.deviation_network,
+                                     self.color_network,
+                                     self.label_network,
+                                     **{'n_samples': 8, 'n_importance': 16, 'n_outside': 0, 'up_sample_steps': 2, 'perturb': 1.0})
+        
+        
+        # optimizers
+        params_to_train = []
+        self.prior_optimizer = torch.optim.Adam(self.sdf_network.prior_network.parameters(), lr=0.01)
+        params_to_train += list(self.sdf_network.tiny_mlp.parameters()) + list(self.sdf_network.hash_encoding.parameters())
+        params_to_train += list(self.deviation_network.parameters())
+        params_to_train += list(self.color_network.parameters())
+        params_to_train += list(self.label_network.parameters())
+        self.optimizer = torch.optim.Adam([{'params':params_to_train, 'name': 'all_other'}], lr=self.learning_rate)
+
+        self.ego_points = None
+        self.ego_normals = None
+        self.scale_mat = np.asarray([[500, 0, 0, 0],
+                                       [0, 500, 0, 0],
+                                       [0, 0, 9, 0],
+                                       [0, 0, 0, 1]], dtype=np.float32)
+        self.omnire_w2neus_w = torch.tensor([[1, 0, 0, 0], [0, 0, 1, 0], [0, -1, 0, 1.51], [0, 0, 0, 1]]).type(torch.float32).to(self.device)
+        # self.pretrain_sdf()
+        
+        self.iter_step = 0
+        self.base_exp_dir = 'neus_ground'
+        if not os.path.exists(self.base_exp_dir):
+            os.makedirs(self.base_exp_dir)
+        
+        
+        
+    def validate_image(self, image_infos, camera_infos, idx=-1):
+        # assert idx >= 0
+
+        # print('Validate: iter: {}, camera: {}'.format(self.iter_step, idx))
+
+        rays_d = image_infos['viewdirs']
+        camera_encod = camera_infos['cam_id']
+        c2w = camera_infos['camera_to_world']
+        gt_img = image_infos['pixels']
+        c2w = self.omnire_w2neus_w @ c2w
+        c2w = torch.linalg.inv(torch.from_numpy(self.scale_mat)).cuda().float() @ c2w
+        
+        rays_d = rays_d @ c2w[:3, :3].T
+        rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+        rays_o = c2w[:3, 3].unsqueeze(0).expand(rays_d.shape)
+        
+        # rays_d = torch.matmul(rays_d, extrinsic_modification[:3, :3].T)
+        # rays_o = torch.matmul(rays_o, extrinsic_modification[:3, :3].T) + extrinsic_modification[:3, 3]
+        
+        camera_encod = camera_infos['cam_id'].reshape(-1, 1)[0]
+        H, W, _ = rays_o.shape
+        rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
+        rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
+
+        out_rgb_fine = []
+        out_rgb_orig = []
+        out_normal_fine = []
+        out_label_fine = []
+        out_depth_fine = []
+        out_beta = []
+
+        for rays_o_batch, rays_d_batch in zip(rays_o, rays_d):
+            near = torch.zeros_like(rays_o_batch[:, 0])
+            far = torch.ones_like(rays_o_batch[:, 0]) * 0.5
+            near = near.unsqueeze(-1)
+            far = far.unsqueeze(-1)
+
+            background_rgb = torch.ones([1, 3]) if self.use_white_bkgd else None
+
+            render_out = self.renderer.render(rays_o_batch,
+                                              rays_d_batch,
+                                              near,
+                                              far,
+                                              cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                              background_rgb=background_rgb,
+                                              camera_encod=camera_encod)
+
+            out_rgb_orig.append(render_out['orig_color'].detach().cpu().numpy())
+
+            def feasible(key): return (key in render_out) and (render_out[key] is not None)
+
+            if feasible('color_fine'):
+                out_rgb_fine.append(render_out['color_fine'].detach().cpu().numpy())
+            if feasible('gradients') and feasible('weights'):
+                n_samples = self.renderer.n_samples + self.renderer.n_importance
+                normals = render_out['gradients'] * render_out['weights'][:, :n_samples, None]
+                if feasible('inside_sphere'):
+                    normals = normals * render_out['inside_sphere'][..., None]
+                normals = normals.sum(dim=1).detach().cpu().numpy()
+                out_normal_fine.append(normals)
+            if feasible('label'):
+                out_label_fine.append(render_out['label'].detach().cpu().numpy())
+            out_depth_fine.append(render_out['depth'].detach().cpu().numpy())
+            out_beta.append(render_out['beta'].detach().cpu().numpy())
+            del render_out
+            
+        img_fine = None
+        os.makedirs(os.path.join(self.base_exp_dir, 'validations_fine'), exist_ok=True)
+        os.makedirs(os.path.join(self.base_exp_dir, 'normals'), exist_ok=True)
+        if len(out_rgb_fine) > 0:
+            img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3, -1]) * 255).clip(0, 255).astype(np.uint8)
+        if len(out_rgb_orig) > 0:
+            img_orig = (np.concatenate(out_rgb_orig, axis=0).reshape([H, W, 3, -1]) * 255).clip(0, 255).astype(np.uint8)
+        label_img = None
+        if len(out_label_fine) > 0:
+            label_img = np.concatenate(out_label_fine, axis=0)
+            label_img = np.argmax(label_img, axis=-1)
+            label_img_gt_raw = label_img
+            label_img = np.array(idx2color)[label_img].reshape([H, W, 3, -1]).clip(0, 255)
+            label_img_gt = np.array(idx2color)[label_img_gt_raw].reshape([H, W, 3]).clip(0, 255)
+        gt_img = gt_img.cpu().numpy() * 255
+        road_mask = label_img_gt_raw > 0
+        for i in range(img_fine.shape[-1]):
+            if len(out_rgb_fine) > 0:
+                rgb_diff = np.abs(img_fine[..., i] - gt_img)
+                # rgb_diff[~road_mask] = 0
+                image_cat = np.concatenate([img_fine[..., i],
+                                            gt_img, rgb_diff])
+                orig_cat = np.concatenate([img_orig[..., i],
+                                           img_orig[..., i], 
+                                           img_orig[..., i]])
+                label_diff = np.abs(label_img[..., i] - label_img_gt)
+                # label_diff[~road_mask] = 0
+                label_cat = np.concatenate([label_img[..., i], label_img_gt, label_diff])
+                cv2.imwrite(os.path.join(self.base_exp_dir,
+                                        'validations_fine',
+                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                            np.concatenate([orig_cat, image_cat, label_cat], axis=1)
+                        )
+            
+        
+    def points2cluster(self, points, k=1, is_world=False, kd_tree=True, return_idx=False):
+        """
+        points: np.ndarray/torch.tensor, shape (N, 3)
+        return: torch.tensor, shape (N, k)
+        """
+        if type(points) == np.ndarray:
+            points = torch.from_numpy(points).cpu()
+        if kd_tree:
+            scale_mat = self.scale_mat[:3, :3]
+        else:
+            scale_mat = torch.from_numpy(self.scale_mat[:3, :3]).cuda()
+        if not is_world:
+            points_world = points @ scale_mat
+        else:
+            points_world = points
+
+        modified_ego_points = self.ego_points.copy()
+        if not kd_tree:
+            modified_ego_points = torch.tensor(modified_ego_points, device=points.device)
+
+        modified_ego_points[:, 2] *= 3
+        points_world[:, 2] *= 3
+        
+        if kd_tree:
+            kd_tree = cKDTree(modified_ego_points)
+            # filter based on closest ego point
+            vertices_prior_world_cpu = points_world
+            dist, idx = kd_tree.query(vertices_prior_world_cpu, k=k)
+        else:
+            dist, idx = nn_2d_k(modified_ego_points, points_world, k=k)
+        # grid2cluster = ego2cluster[idx]
+        grid2cluster = torch.zeros_like(idx)
+
+        if return_idx:
+            return grid2cluster, idx
+        else:
+            return grid2cluster
+        
+    def pretrain_sdf(self):
+        
+        if type(self.ego_points) == torch.Tensor:
+            self.ego_points = self.ego_points.cpu().numpy()
+        if type(self.ego_normals) == torch.Tensor:
+            self.ego_normals = self.ego_normals.cpu().numpy()
+        
+        world_ego_points = self.ego_points
+        bev_ego_points = world_ego_points @ np.linalg.inv(self.scale_mat[:3, :3]) - self.scale_mat[:3, 3]
+        bev_ego_points = torch.from_numpy(bev_ego_points).to(self.device).float()
+        world_ego_points = torch.from_numpy(world_ego_points).to(self.device).float()
+
+        world_ego_normals = self.ego_normals
+        
+        world_ego_normals = torch.from_numpy(world_ego_normals).to(self.device)
+
+        world_coff_A, world_coff_B = world_ego_normals[:, 0] / world_ego_normals[:, 2], world_ego_normals[:, 1] / world_ego_normals[:, 2]
+        self.sdf_network.prior_network.world_coff_A = world_coff_A
+        self.sdf_network.prior_network.world_coff_B = world_coff_B
+        self.sdf_network.prior_network.world_ego_points = world_ego_points
+        loop = tqdm(range(20000))
+        loop.set_description("initializing sdf with ego points normal")
+        for it in loop:
+            # generate random xyz around ego points
+            bev_rand_xyz = bev_ego_points + torch.randn(bev_ego_points.shape, device=self.device) / 100
+            world_rand_xyz = bev_rand_xyz @ torch.from_numpy(self.scale_mat[:3, :3]).cuda().float()
+
+
+            cluster_idx, nn_idx_more = self.points2cluster(world_rand_xyz, k=1, is_world=True, kd_tree=False, return_idx=True)
+            # find closest ego point for each random xyz
+            # nn_dist, nn_idx_more = nn_2d_k(world_ego_points, world_rand_xyz, k=8)
+            
+            # nn_idx = nn_2d(world_ego_points, world_rand_xyz)
+            choice = torch.randint(0, 1, [bev_rand_xyz.shape[0]])
+            nn_idx = nn_idx_more[torch.arange(bev_rand_xyz.shape[0]), choice]
+
+            # get cluster for each random xyz
+            cluster_idx = cluster_idx[:, 0]
+
+            # get target z (each random xyz should be on the plane of the closest ego point)
+            world_rand_z = -world_coff_A[nn_idx] * (world_rand_xyz[:, 0] - world_ego_points[nn_idx, 0]) - world_coff_B[nn_idx] * (world_rand_xyz[:, 1] - world_ego_points[nn_idx, 1]) + world_ego_points[nn_idx, 2]
+            bev_rand_z = world_rand_z / self.scale_mat[2, 2]
+
+
+            # iterate over clusters
+            for i in range(1):
+                self.prior_optimizer.zero_grad()
+                mask = cluster_idx == i
+                input_xy = bev_rand_xyz[mask, :2]
+                target_z = bev_rand_z[mask]
+                prior_sdf = self.sdf_network.prior_network[i](input_xy) # select i-th prior network
+                prior_loss = F.l1_loss(prior_sdf.squeeze(), target_z.squeeze())
+                prior_loss.backward()
+                self.prior_optimizer.step()
+
+                if it < 5000:
+                    sdf = self.sdf_network(bev_rand_xyz[:, :2], delta=False, force_cluster=i)[:, 0]
+                    loss = torch.abs(sdf).mean()
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    self.optimizer.step()
+        
+        
+    def get_cos_anneal_ratio(self):
+        if self.anneal_end == 0.0:
+            return 1.0
+        else:
+            return np.min([1.0, self.iter_step / self.anneal_end])
+    def forward(self, image_infos, camera_infos) -> torch.Tensor:
+        """
+        image_infos: {
+            'origins': torch.Tensor, [900 / d, 1600 / d, 3]. 都是同一个origin
+            'viewdirs': torch.Tensor, [900 / d, 1600 / d, 3]. 
+            'direction_norm': torch.Tensor, [900 / d, 1600 / d, 1]. ???
+            'pixel_coords': torch.Tensor, [900 / d, 1600 / d, 2]. normalized pixel coordinates
+            'normed_time': torch.Tensor, [900 / d, 1600 / d]. normalized time. 猜测是整个bag的时间戳在0-1之间的归一化
+            'img_idx': torch.Tensor, [900 / d, 1600 / d]. 
+            'frame_idx': torch.Tensor, [900 / d, 1600 / d].
+            'pixels': torch.Tensor, [900 / d, 1600 / d, 3]. RGB
+            'sky_masks': torch.Tensor, [900 / d, 1600 / d]. 估计1代表天空
+            'dynamic_masks': torch.Tensor, [900 / d, 1600 / d]. 
+            'human_masks': torch.Tensor, [900 / d, 1600 / d].
+            'vehicle_masks': torch.Tensor, [900 / d, 1600 / d].
+            'lidar_depth_map': torch.Tensor, [900 / d, 1600 / d].
+        }
+        
+        camera_infos: {
+            'cam_id': torch.Tensor, [900 / d, 1600 / d].
+            'cam_name': str.
+            'camera_to_world': torch.Tensor, [4, 4]. #TODO: nuscenes相机高度从哪里来
+            'height': torch.Tensor, [1]. image height
+            'width': torch.Tensor, [1]. image width
+            'intrinsics': torch.Tensor, [3, 3].
+        }
+        
+        return rgb
+        """
+        
+        if self.iter_step % 100 == 0:
+            self.validate_image(image_infos, camera_infos)
+        if self.iter_step % 1000 == 0:
+            self.validate_mesh()
+        
+        H, W, _ = image_infos['viewdirs'].shape
+        print(self.iter_step, H, W)
+        
+        rays_d = image_infos['viewdirs']# @ self.omnire_w2neus_w[:3, :3].T
+        camera_encod = camera_infos['cam_id']
+        c2w = camera_infos['camera_to_world']
+        c2w = self.omnire_w2neus_w @ c2w
+        
+        c2w = torch.linalg.inv(torch.from_numpy(self.scale_mat)).cuda().float() @ c2w
+        
+        # gt reshape
+        
+        near = torch.zeros_like(rays_d[:, :, 0], device=self.device)
+        far = torch.ones_like(rays_d[:, :, 0], device=self.device) * 0.5
+        near = near.unsqueeze(-1)
+        far = far.unsqueeze(-1)
+        
+        modified_c2w = c2w
+        rays_d = rays_d @ modified_c2w[:3, :3].T
+        rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+        rays_o = modified_c2w[:3, 3].unsqueeze(0).unsqueeze(0).expand(rays_d.shape)
+
+        self.sdf_network.iter_step = self.iter_step
+        self.renderer.iter_step = self.iter_step
+        
+        self.sdf_network.requires_grad_(True)
+
+        render_out = self.renderer.render(rays_o.reshape(-1, 3), rays_d.reshape(-1, 3), near.reshape(-1, 1), far.reshape(-1, 1),
+                                        background_rgb=None,
+                                        cos_anneal_ratio=self.get_cos_anneal_ratio(),
+                                        camera_encod=camera_encod.reshape(-1))
+        
+        self.iter_step += 1
+        return render_out
+    def get_loss(self, render_out, image_infos, camera_infos):
+        true_rgb = image_infos['pixels']
+        H, W, _ = true_rgb.shape
+        mask = torch.zeros_like(true_rgb[:, :, 0])
+        mask[int(H / 2):, :] = 1
+        # gt_seg = data['seg'].to(self.device)
+        image_batch_size, batch_size = H, W
+        
+
+        color_fine = render_out['color_fine']
+        gradient_error = render_out['gradient_error']
+        # label = render_out['label']
+        delta_loss = render_out['delta_loss']
+        delta_color = render_out['delta_color']
+        
+        delta_color_loss = F.mse_loss(delta_color, torch.zeros_like(delta_color))
+        
+        
+        true_rgb = true_rgb.reshape(image_batch_size * batch_size, -1)
+        mask = mask.reshape(image_batch_size * batch_size, -1)
+
+
+        color_mask = (mask > 0).float()     # color loss only applied to road
+
+        mask_sum = color_mask.sum() + 1e-5
+        lumin_mask = (torch.mean(true_rgb, dim=-1) > 0.1).float()
+
+        color_mask *= lumin_mask.unsqueeze(-1)
+        
+        color_error = (color_fine - true_rgb) * color_mask
+
+        lumin_error = color_error[:, 0]
+
+        lumin_error = lumin_error * lumin_mask
+        color_error = color_error[:, 1:]
+        color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
+
+        
+        lumin_fine_loss = F.l1_loss(lumin_error, torch.zeros_like(lumin_error), reduction='sum') / ((color_mask.squeeze(-1) * lumin_mask).sum() + 1e-5)
+        color_fine_loss += lumin_fine_loss
+
+        psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * color_mask).sum() / (mask_sum * 3.0)).sqrt())
+        bev_to_world_factor = 9 ** 2 / 500 ** 2
+        eikonal_loss = gradient_error * bev_to_world_factor
+
+        if self.iter_step == 1:
+            print('eikonal_loss weight: {}'.format(bev_to_world_factor * self.igr_weight))
+        loss = color_fine_loss +\
+            eikonal_loss * self.igr_weight  +\
+            delta_loss * 0
+
+        loss += delta_color_loss * 0.05 * 10
+
+        return loss
+    def backward(self, loss):
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+    
+    def validate_mesh(self, cluster_idx=0):
+        
+        xy = torch.meshgrid(torch.arange(-1, 1, 0.05 / self.scale_mat[0, 0], device=torch.device("cpu")), torch.arange(-1, 1, 0.05 / self.scale_mat[1, 1], device=torch.device("cpu")))
+        xy_grid = torch.stack([xy[0], xy[1]], dim=-1)
+        num_pixels = xy_grid.shape[0]
+        canvas = np.zeros([num_pixels, num_pixels], dtype=np.uint8)
+        scale_xy = self.scale_mat[0, 0]
+        for x, y, z in self.ego_points:
+            x = int((x / scale_xy + 1) / 2 * num_pixels)
+            y = int((y / scale_xy + 1) / 2 * num_pixels)
+            canvas[x, y] = 1
+        
+        # dilate 
+        canvas_big = cv2.dilate(canvas, np.ones((1000, 1000), np.uint8), iterations=1)
+        xy = xy_grid[canvas_big.astype(np.bool_)]
+        xy = xy.cuda()
+
+
+        # filter based on ego points
+        torch.cuda.empty_cache()
+        xy_world = xy @ torch.from_numpy(self.scale_mat[:2, :2]).cuda() + torch.from_numpy(self.scale_mat[:2, 3]).cuda()
+        mask_xy = torch.zeros(xy_world.shape[0], dtype=torch.bool, device=xy_world.device)
+
+        for i in tqdm(range(len(self.ego_points)), desc='Filtering'):
+            x, y, _ = self.ego_points[i]
+            dist = torch.norm(xy_world - torch.tensor([x, y], dtype=torch.float32, device=xy_world.device), dim=-1)
+            mask = dist < 15
+            mask_xy = mask_xy | mask
+        xy = xy[mask_xy]
+        
+            
+            
+        print("# of points after cropping: " + str(xy.shape[0]))
+        BATCH_SIZE = 4096
+        torch.cuda.empty_cache()
+        with torch.no_grad():
+            z = torch.zeros(xy.shape[0], dtype=torch.float32, device=xy.device)
+            z_prior = torch.zeros(xy.shape[0], dtype=torch.float32, device=xy.device)
+            for i in range(0, xy.shape[0], BATCH_SIZE):
+                xy_batch = xy[i:i + BATCH_SIZE]
+                sdf_nn_output_batch = self.sdf_network(xy_batch, output_height=True, force_cluster=cluster_idx)
+                z[i:i + BATCH_SIZE] = sdf_nn_output_batch[:, 0]
+                
+                z_prior[i:i + BATCH_SIZE] = self.sdf_network.prior_network[cluster_idx](xy_batch).squeeze(-1)
+            z = z.unsqueeze(-1)
+            z_prior = z_prior.unsqueeze(-1)
+        vertices = torch.cat([xy, z], dim=-1)
+        vertices_prior = torch.cat([xy, z_prior], dim=-1)
+        
+        vertices_prior_world = vertices_prior @ torch.from_numpy(self.scale_mat[:3, :3]).cuda() + torch.from_numpy(self.scale_mat[:3, 3]).cuda()
+        
+        # 获得ego pose to cluster #
+        # grid2cluster = self.points2cluster(vertices_prior_world.cpu().numpy(), k=1, is_world=True)
+        
+        # mask = grid2cluster == cluster_idx
+        
+        # vertices = vertices[mask]
+        # z = z[mask]
+        # z_prior = z_prior[mask]
+        # xy = xy[mask]
+
+        delta_z = (z - z_prior) * self.scale_mat[2, 2]
+        delta_z = delta_z.detach().cpu().numpy()
+
+        vertices_prior = torch.cat([xy, z_prior], dim=-1)
+        vertices_prior = vertices_prior @ torch.from_numpy(self.scale_mat[:3, :3]).cuda() + torch.from_numpy(self.scale_mat[:3, 3]).cuda()
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices_prior.detach().cpu().numpy())
+        o3d.io.write_point_cloud(os.path.join(self.base_exp_dir, "prior_{}.pcd".format(cluster_idx)), pcd)
+
+        colors, betas = self.renderer.extract_color(vertices, cluster_idx=cluster_idx)
+        labels = self.renderer.extract_labels(vertices, cluster_idx=cluster_idx)
+        vertices = vertices.detach().cpu().numpy()
+        vertices = vertices @ self.scale_mat[:3, :3] + self.scale_mat[:3, 3]
+        colors = torch.stack([colors[:, 2], colors[:, 1], colors[:, 0]], dim=-1)
+        colors = colors.detach().cpu().numpy()
+
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(vertices)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+        o3d.io.write_point_cloud(os.path.join(self.base_exp_dir, '2d_%d_%d.pcd' % (self.iter_step, cluster_idx)), pcd)
+        
+
+
+        labels = labels.argmax(dim=-1).detach().cpu().numpy()
+        
+        label_colors = np.array(idx2color)[labels].astype(np.float32) / 255.
+
+        pcd.colors = o3d.utility.Vector3dVector(label_colors)
+        o3d.io.write_point_cloud(os.path.join(self.base_exp_dir, '2d_label_%d_%d.pcd' % (self.iter_step, cluster_idx)), pcd)
+        
+        
+        
+        # save ego_points
+        all_points = []
+        for i in range(len(self.ego_points)):
+            for j in np.arange(0, 1, 0.1):
+                all_points.append(self.ego_points[i] + self.ego_normals[i] * j)
+        all_points = np.array(all_points)
+
+        # save ego points
+        pcd = o3d.geometry.PointCloud()
+        pcd.points = o3d.utility.Vector3dVector(all_points)
+        o3d.io.write_point_cloud(os.path.join(self.base_exp_dir, "ego_points.pcd"), pcd)
+        
+    def get_param_groups(self):
+        return {
+            "Ground#"+"all": self.parameters(),
+        }
