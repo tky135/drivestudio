@@ -20,7 +20,7 @@ from utils.visualization import (
 logger = logging.getLogger()
 
 def get_numpy(x: Tensor) -> np.ndarray:
-    return x.squeeze().cpu().numpy()
+    return x.detach().squeeze().cpu().numpy()
 
 def non_zero_mean(x: Tensor) -> float:
     return sum(x) / len(x) if len(x) > 0 else -1
@@ -124,198 +124,198 @@ def render(
         vehicle_psnrs, vehicle_ssims = [], []
         occupied_psnrs, occupied_ssims = [], []
 
-    with torch.no_grad():
-        indices = vis_indices if vis_indices is not None else range(len(dataset))
-        camera_downscale = trainer._get_downscale_factor()
-        for i in tqdm(indices, desc=f"rendering {dataset.split}", dynamic_ncols=True):
-            # get image and camera infos
-            image_infos, cam_infos = dataset.get_image(i, camera_downscale)
-            for k, v in image_infos.items():
-                if isinstance(v, Tensor):
-                    image_infos[k] = v.cuda(non_blocking=True)
-            for k, v in cam_infos.items():
-                if isinstance(v, Tensor):
-                    cam_infos[k] = v.cuda(non_blocking=True)
-            # render the image
-            results = trainer(image_infos, cam_infos)
+    # with torch.no_grad():
+    indices = vis_indices if vis_indices is not None else range(len(dataset))
+    camera_downscale = trainer._get_downscale_factor()
+    for i in tqdm(indices, desc=f"rendering {dataset.split}", dynamic_ncols=True):
+        # get image and camera infos
+        image_infos, cam_infos = dataset.get_image(i, camera_downscale)
+        for k, v in image_infos.items():
+            if isinstance(v, Tensor):
+                image_infos[k] = v.cuda(non_blocking=True)
+        for k, v in cam_infos.items():
+            if isinstance(v, Tensor):
+                cam_infos[k] = v.cuda(non_blocking=True)
+        # render the image
+        results = trainer(image_infos, cam_infos)
+        
+        # ------------- clip rgb ------------- #
+        for k, v in results.items():
+            if isinstance(v, Tensor) and "rgb" in k:
+                results[k] = v.clamp(0., 1.)
+        
+        # ------------- cam names ------------- #
+        cam_names.append(cam_infos["cam_name"])
+        cam_ids.append(
+            cam_infos["cam_id"].flatten()[0].cpu().numpy()
+        )
+
+        # ------------- rgb ------------- #
+        rgb = results["rgb"]
+        rgbs.append(get_numpy(rgb))
+        if "pixels" in image_infos:
+            gt_rgbs.append(get_numpy(image_infos["pixels"]))
             
-            # ------------- clip rgb ------------- #
-            for k, v in results.items():
-                if isinstance(v, Tensor) and "rgb" in k:
-                    results[k] = v.clamp(0., 1.)
+        green_background = torch.tensor([0.0, 177, 64]) / 255.0
+        green_background = green_background.to(rgb.device)
+        if "Background_rgb" in results:
+            Background_rgb = results["Background_rgb"] * results[
+                "Background_opacity"
+            ] + green_background * (1 - results["Background_opacity"])
+            Background_rgbs.append(get_numpy(Background_rgb))
+        if "RigidNodes_rgb" in results:
+            RigidNodes_rgb = results["RigidNodes_rgb"] * results[
+                "RigidNodes_opacity"
+            ] + green_background * (1 - results["RigidNodes_opacity"])
+            RigidNodes_rgbs.append(get_numpy(RigidNodes_rgb))
+        if "DeformableNodes_rgb" in results:
+            DeformableNodes_rgb = results["DeformableNodes_rgb"] * results[
+                "DeformableNodes_opacity"
+            ] + green_background * (1 - results["DeformableNodes_opacity"])
+            DeformableNodes_rgbs.append(get_numpy(DeformableNodes_rgb))
+        if "SMPLNodes_rgb" in results:
+            SMPLNodes_rgb = results["SMPLNodes_rgb"] * results[
+                "SMPLNodes_opacity"
+            ] + green_background * (1 - results["SMPLNodes_opacity"])
+            SMPLNodes_rgbs.append(get_numpy(SMPLNodes_rgb))
+        if "Dynamic_rgb" in results:
+            Dynamic_rgb = results["Dynamic_rgb"] * results[
+                "Dynamic_opacity"
+            ] + green_background * (1 - results["Dynamic_opacity"])
+            Dynamic_rgbs.append(get_numpy(Dynamic_rgb))
+        if compute_error_map:
+            # cal mean squared error
+            error_map = (rgb - image_infos["pixels"]) ** 2
+            error_map = error_map.mean(dim=-1, keepdim=True)
+            # scale
+            error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min())
+            error_map = error_map.repeat_interleave(3, dim=-1)
+            error_maps.append(get_numpy(error_map))
+        if "rgb_sky_blend" in results:
+            rgb_sky_blend.append(get_numpy(results["rgb_sky_blend"]))
+        if "rgb_sky" in results:
+            rgb_sky.append(get_numpy(results["rgb_sky"]))
+        # ------------- depth ------------- #
+        depth = results["depth"]
+        depths.append(get_numpy(depth))
+        # ------------- mask ------------- #
+        if "opacity" in results:
+            opacities.append(get_numpy(results["opacity"]))
+        if "Background_depth" in results:
+            Background_depths.append(get_numpy(results["Background_depth"]))
+            Background_opacities.append(get_numpy(results["Background_opacity"]))
+        if "RigidNodes_depth" in results:
+            RigidNodes_depths.append(get_numpy(results["RigidNodes_depth"]))
+            RigidNodes_opacities.append(get_numpy(results["RigidNodes_opacity"]))
+        if "DeformableNodes_depth" in results:
+            DeformableNodes_depths.append(get_numpy(results["DeformableNodes_depth"]))
+            DeformableNodes_opacities.append(get_numpy(results["DeformableNodes_opacity"]))
+        if "SMPLNodes_depth" in results:
+            SMPLNodes_depths.append(get_numpy(results["SMPLNodes_depth"]))
+            SMPLNodes_opacities.append(get_numpy(results["SMPLNodes_opacity"]))
+        if "Dynamic_depth" in results:
+            Dynamic_depths.append(get_numpy(results["Dynamic_depth"]))
+            Dynamic_opacities.append(get_numpy(results["Dynamic_opacity"]))
+        if "sky_masks" in image_infos:
+            sky_masks.append(get_numpy(image_infos["sky_masks"]))
             
-            # ------------- cam names ------------- #
-            cam_names.append(cam_infos["cam_name"])
-            cam_ids.append(
-                cam_infos["cam_id"].flatten()[0].cpu().numpy()
+        # ------------- lidar ------------- #
+        if "lidar_depth_map" in image_infos:
+            depth_map = image_infos["lidar_depth_map"]
+            depth_img = depth_map.cpu().numpy()
+            depth_img = depth_visualizer(depth_img, depth_img > 0)
+            mask = (depth_map.unsqueeze(-1) > 0).cpu().numpy()
+            lidar_on_image = image_infos["pixels"].cpu().numpy() * (1 - mask) + depth_img * mask
+            lidar_on_images.append(lidar_on_image)
+
+        if compute_metrics:
+            psnr = compute_psnr(rgb, image_infos["pixels"])
+            ssim_score = ssim(
+                get_numpy(rgb),
+                get_numpy(image_infos["pixels"]),
+                data_range=1.0,
+                channel_axis=-1,
             )
-
-            # ------------- rgb ------------- #
-            rgb = results["rgb"]
-            rgbs.append(get_numpy(rgb))
-            if "pixels" in image_infos:
-                gt_rgbs.append(get_numpy(image_infos["pixels"]))
-                
-            green_background = torch.tensor([0.0, 177, 64]) / 255.0
-            green_background = green_background.to(rgb.device)
-            if "Background_rgb" in results:
-                Background_rgb = results["Background_rgb"] * results[
-                    "Background_opacity"
-                ] + green_background * (1 - results["Background_opacity"])
-                Background_rgbs.append(get_numpy(Background_rgb))
-            if "RigidNodes_rgb" in results:
-                RigidNodes_rgb = results["RigidNodes_rgb"] * results[
-                    "RigidNodes_opacity"
-                ] + green_background * (1 - results["RigidNodes_opacity"])
-                RigidNodes_rgbs.append(get_numpy(RigidNodes_rgb))
-            if "DeformableNodes_rgb" in results:
-                DeformableNodes_rgb = results["DeformableNodes_rgb"] * results[
-                    "DeformableNodes_opacity"
-                ] + green_background * (1 - results["DeformableNodes_opacity"])
-                DeformableNodes_rgbs.append(get_numpy(DeformableNodes_rgb))
-            if "SMPLNodes_rgb" in results:
-                SMPLNodes_rgb = results["SMPLNodes_rgb"] * results[
-                    "SMPLNodes_opacity"
-                ] + green_background * (1 - results["SMPLNodes_opacity"])
-                SMPLNodes_rgbs.append(get_numpy(SMPLNodes_rgb))
-            if "Dynamic_rgb" in results:
-                Dynamic_rgb = results["Dynamic_rgb"] * results[
-                    "Dynamic_opacity"
-                ] + green_background * (1 - results["Dynamic_opacity"])
-                Dynamic_rgbs.append(get_numpy(Dynamic_rgb))
-            if compute_error_map:
-                # cal mean squared error
-                error_map = (rgb - image_infos["pixels"]) ** 2
-                error_map = error_map.mean(dim=-1, keepdim=True)
-                # scale
-                error_map = (error_map - error_map.min()) / (error_map.max() - error_map.min())
-                error_map = error_map.repeat_interleave(3, dim=-1)
-                error_maps.append(get_numpy(error_map))
-            if "rgb_sky_blend" in results:
-                rgb_sky_blend.append(get_numpy(results["rgb_sky_blend"]))
-            if "rgb_sky" in results:
-                rgb_sky.append(get_numpy(results["rgb_sky"]))
-            # ------------- depth ------------- #
-            depth = results["depth"]
-            depths.append(get_numpy(depth))
-            # ------------- mask ------------- #
-            if "opacity" in results:
-                opacities.append(get_numpy(results["opacity"]))
-            if "Background_depth" in results:
-                Background_depths.append(get_numpy(results["Background_depth"]))
-                Background_opacities.append(get_numpy(results["Background_opacity"]))
-            if "RigidNodes_depth" in results:
-                RigidNodes_depths.append(get_numpy(results["RigidNodes_depth"]))
-                RigidNodes_opacities.append(get_numpy(results["RigidNodes_opacity"]))
-            if "DeformableNodes_depth" in results:
-                DeformableNodes_depths.append(get_numpy(results["DeformableNodes_depth"]))
-                DeformableNodes_opacities.append(get_numpy(results["DeformableNodes_opacity"]))
-            if "SMPLNodes_depth" in results:
-                SMPLNodes_depths.append(get_numpy(results["SMPLNodes_depth"]))
-                SMPLNodes_opacities.append(get_numpy(results["SMPLNodes_opacity"]))
-            if "Dynamic_depth" in results:
-                Dynamic_depths.append(get_numpy(results["Dynamic_depth"]))
-                Dynamic_opacities.append(get_numpy(results["Dynamic_opacity"]))
+            lpips = trainer.lpips(
+                rgb[None, ...].permute(0, 3, 1, 2),
+                image_infos["pixels"][None, ...].permute(0, 3, 1, 2)
+            )
+            logger.info(f"Frame {i}: PSNR {psnr:.4f}, SSIM {ssim_score:.4f}")
+            psnrs.append(psnr)
+            ssim_scores.append(ssim_score)
+            lpipss.append(lpips.item())
+            
             if "sky_masks" in image_infos:
-                sky_masks.append(get_numpy(image_infos["sky_masks"]))
-                
-            # ------------- lidar ------------- #
-            if "lidar_depth_map" in image_infos:
-                depth_map = image_infos["lidar_depth_map"]
-                depth_img = depth_map.cpu().numpy()
-                depth_img = depth_visualizer(depth_img, depth_img > 0)
-                mask = (depth_map.unsqueeze(-1) > 0).cpu().numpy()
-                lidar_on_image = image_infos["pixels"].cpu().numpy() * (1 - mask) + depth_img * mask
-                lidar_on_images.append(lidar_on_image)
+                occupied_mask = ~get_numpy(image_infos["sky_masks"]).astype(bool)
+                if occupied_mask.sum() > 0:
+                    occupied_psnrs.append(
+                        compute_psnr(
+                            rgb[occupied_mask], image_infos["pixels"][occupied_mask]
+                        )
+                    )
+                    occupied_ssims.append(
+                        ssim(
+                            get_numpy(rgb),
+                            get_numpy(image_infos["pixels"]),
+                            data_range=1.0,
+                            channel_axis=-1,
+                            full=True,
+                        )[1][occupied_mask].mean()
+                    )
 
-            if compute_metrics:
-                psnr = compute_psnr(rgb, image_infos["pixels"])
-                ssim_score = ssim(
-                    get_numpy(rgb),
-                    get_numpy(image_infos["pixels"]),
-                    data_range=1.0,
-                    channel_axis=-1,
-                )
-                lpips = trainer.lpips(
-                    rgb[None, ...].permute(0, 3, 1, 2),
-                    image_infos["pixels"][None, ...].permute(0, 3, 1, 2)
-                )
-                logger.info(f"Frame {i}: PSNR {psnr:.4f}, SSIM {ssim_score:.4f}")
-                psnrs.append(psnr)
-                ssim_scores.append(ssim_score)
-                lpipss.append(lpips.item())
-                
-                if "sky_masks" in image_infos:
-                    occupied_mask = ~get_numpy(image_infos["sky_masks"]).astype(bool)
-                    if occupied_mask.sum() > 0:
-                        occupied_psnrs.append(
-                            compute_psnr(
-                                rgb[occupied_mask], image_infos["pixels"][occupied_mask]
-                            )
+            if "dynamic_masks" in image_infos:
+                dynamic_mask = get_numpy(image_infos["dynamic_masks"]).astype(bool)
+                if dynamic_mask.sum() > 0:
+                    masked_psnrs.append(
+                        compute_psnr(
+                            rgb[dynamic_mask], image_infos["pixels"][dynamic_mask]
                         )
-                        occupied_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][occupied_mask].mean()
+                    )
+                    masked_ssims.append(
+                        ssim(
+                            get_numpy(rgb),
+                            get_numpy(image_infos["pixels"]),
+                            data_range=1.0,
+                            channel_axis=-1,
+                            full=True,
+                        )[1][dynamic_mask].mean()
+                    )
+            
+            if "human_masks" in image_infos:
+                human_mask = get_numpy(image_infos["human_masks"]).astype(bool)
+                if human_mask.sum() > 0:
+                    human_psnrs.append(
+                        compute_psnr(
+                            rgb[human_mask], image_infos["pixels"][human_mask]
                         )
-
-                if "dynamic_masks" in image_infos:
-                    dynamic_mask = get_numpy(image_infos["dynamic_masks"]).astype(bool)
-                    if dynamic_mask.sum() > 0:
-                        masked_psnrs.append(
-                            compute_psnr(
-                                rgb[dynamic_mask], image_infos["pixels"][dynamic_mask]
-                            )
+                    )
+                    human_ssims.append(
+                        ssim(
+                            get_numpy(rgb),
+                            get_numpy(image_infos["pixels"]),
+                            data_range=1.0,
+                            channel_axis=-1,
+                            full=True,
+                        )[1][human_mask].mean()
+                    )
+            
+            if "vehicle_masks" in image_infos:
+                vehicle_mask = get_numpy(image_infos["vehicle_masks"]).astype(bool)
+                if vehicle_mask.sum() > 0:
+                    vehicle_psnrs.append(
+                        compute_psnr(
+                            rgb[vehicle_mask], image_infos["pixels"][vehicle_mask]
                         )
-                        masked_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][dynamic_mask].mean()
-                        )
-                
-                if "human_masks" in image_infos:
-                    human_mask = get_numpy(image_infos["human_masks"]).astype(bool)
-                    if human_mask.sum() > 0:
-                        human_psnrs.append(
-                            compute_psnr(
-                                rgb[human_mask], image_infos["pixels"][human_mask]
-                            )
-                        )
-                        human_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][human_mask].mean()
-                        )
-                
-                if "vehicle_masks" in image_infos:
-                    vehicle_mask = get_numpy(image_infos["vehicle_masks"]).astype(bool)
-                    if vehicle_mask.sum() > 0:
-                        vehicle_psnrs.append(
-                            compute_psnr(
-                                rgb[vehicle_mask], image_infos["pixels"][vehicle_mask]
-                            )
-                        )
-                        vehicle_ssims.append(
-                            ssim(
-                                get_numpy(rgb),
-                                get_numpy(image_infos["pixels"]),
-                                data_range=1.0,
-                                channel_axis=-1,
-                                full=True,
-                            )[1][vehicle_mask].mean()
-                        )
+                    )
+                    vehicle_ssims.append(
+                        ssim(
+                            get_numpy(rgb),
+                            get_numpy(image_infos["pixels"]),
+                            data_range=1.0,
+                            channel_axis=-1,
+                            full=True,
+                        )[1][vehicle_mask].mean()
+                    )
 
     # messy aggregation...
     results_dict = {}

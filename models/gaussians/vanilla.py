@@ -288,7 +288,7 @@ class VanillaGaussians(nn.Module):
                 # NOTE: in nerfstudio, reset_value = cull_alpha_thresh * 0.8
                     # we align to original repo of gaussians spalting
                 reset_value = torch.min(self.get_opacity.data,
-                                        torch.ones_like(self._opacities.data) * self.ctrl_cfg.reset_alpha_value)
+                                        torch.ones_like(self._opacities.data) * 0.01)
                 self._opacities.data = torch.logit(reset_value)
                 # reset the exp of optimizer
                 for group in optimizer.param_groups:

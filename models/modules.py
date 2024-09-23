@@ -751,7 +751,7 @@ class Ground(nn.Module):
         # self.pretrain_sdf()
         
         self.iter_step = 0
-        self.base_exp_dir = 'neus_ground'
+        self.base_exp_dir = '3_6cams_selfsup'
         if not os.path.exists(self.base_exp_dir):
             os.makedirs(self.base_exp_dir)
         
@@ -762,14 +762,20 @@ class Ground(nn.Module):
 
         # print('Validate: iter: {}, camera: {}'.format(self.iter_step, idx))
 
-        rays_d = image_infos['viewdirs']
+        rays_d = image_infos['viewdirs'] @ self.omnire_w2neus_w[:3, :3].T @ torch.linalg.inv(torch.from_numpy(self.scale_mat[:3, :3])).cuda().float().T
         camera_encod = camera_infos['cam_id']
         c2w = camera_infos['camera_to_world']
         gt_img = image_infos['pixels']
         c2w = self.omnire_w2neus_w @ c2w
         c2w = torch.linalg.inv(torch.from_numpy(self.scale_mat)).cuda().float() @ c2w
+        H, W, _ = gt_img.shape
+        # mask = torch.ones([H, W], device=self.device)
+        # mask[image_infos['dynamic_masks'] == 1] = 0
+        # mask[image_infos['sky_masks'] == 1] = 0
+        # mask[:int(3 / 5 * H), :] = 0
+        mask = image_infos['road_masks']
+        mask = mask.cpu().numpy()
         
-        rays_d = rays_d @ c2w[:3, :3].T
         rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
         rays_o = c2w[:3, 3].unsqueeze(0).expand(rays_d.shape)
         
@@ -839,22 +845,25 @@ class Ground(nn.Module):
             label_img_gt = np.array(idx2color)[label_img_gt_raw].reshape([H, W, 3]).clip(0, 255)
         gt_img = gt_img.cpu().numpy() * 255
         road_mask = label_img_gt_raw > 0
+        gaussian_img = image_infos['gaussian_rgb'].cpu().numpy() * 255
         for i in range(img_fine.shape[-1]):
             if len(out_rgb_fine) > 0:
                 rgb_diff = np.abs(img_fine[..., i] - gt_img)
-                # rgb_diff[~road_mask] = 0
+                rgb_diff[mask == 0] = np.array([255, 0, 0])
                 image_cat = np.concatenate([img_fine[..., i],
                                             gt_img, rgb_diff])
                 orig_cat = np.concatenate([img_orig[..., i],
-                                           img_orig[..., i], 
+                                           gaussian_img, 
                                            img_orig[..., i]])
                 label_diff = np.abs(label_img[..., i] - label_img_gt)
                 # label_diff[~road_mask] = 0
                 label_cat = np.concatenate([label_img[..., i], label_img_gt, label_diff])
+                
+                output_img = np.concatenate([orig_cat, image_cat, label_cat], axis=1).astype(np.uint8)
                 cv2.imwrite(os.path.join(self.base_exp_dir,
                                         'validations_fine',
                                         '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
-                            np.concatenate([orig_cat, image_cat, label_cat], axis=1)
+                            cv2.cvtColor(output_img, cv2.COLOR_RGB2BGR)
                         )
             
         
@@ -994,16 +1003,25 @@ class Ground(nn.Module):
         return rgb
         """
         
-        if self.iter_step % 100 == 0:
-            self.validate_image(image_infos, camera_infos)
-        if self.iter_step % 1000 == 0:
-            self.validate_mesh()
+        # if self.iter_step % 100 == 0:
+        #     self.validate_image(image_infos, camera_infos)
+        # if self.iter_step % 1000 == 0:
+        #     self.validate_mesh()
         
         H, W, _ = image_infos['viewdirs'].shape
-        print(self.iter_step, H, W)
-        
-        rays_d = image_infos['viewdirs']# @ self.omnire_w2neus_w[:3, :3].T
+
+        mask = image_infos['road_masks']
+        rays_d = image_infos['viewdirs'] @ self.omnire_w2neus_w[:3, :3].T @ torch.linalg.inv(torch.from_numpy(self.scale_mat[:3, :3])).cuda().float().T
         camera_encod = camera_infos['cam_id']
+        rays_d = rays_d[mask == 1]
+        camera_encod = camera_encod[mask == 1]
+        gt_rgb = image_infos['pixels'][mask == 1]
+        
+        # rand_indices = torch.randint(0, rays_d.shape[0], [self.batch_size])
+        # rays_d = rays_d[rand_indices]
+        # camera_encod = camera_encod[rand_indices]
+        # gt_rgb = gt_rgb[rand_indices]
+        
         c2w = camera_infos['camera_to_world']
         c2w = self.omnire_w2neus_w @ c2w
         
@@ -1011,15 +1029,14 @@ class Ground(nn.Module):
         
         # gt reshape
         
-        near = torch.zeros_like(rays_d[:, :, 0], device=self.device)
-        far = torch.ones_like(rays_d[:, :, 0], device=self.device) * 0.5
+        near = torch.zeros_like(rays_d[:, 0], device=self.device)
+        far = torch.ones_like(rays_d[:, 0], device=self.device) * 0.5
         near = near.unsqueeze(-1)
         far = far.unsqueeze(-1)
         
         modified_c2w = c2w
-        rays_d = rays_d @ modified_c2w[:3, :3].T
         rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
-        rays_o = modified_c2w[:3, 3].unsqueeze(0).unsqueeze(0).expand(rays_d.shape)
+        rays_o = modified_c2w[:3, 3].unsqueeze(0).expand(rays_d.shape)
 
         self.sdf_network.iter_step = self.iter_step
         self.renderer.iter_step = self.iter_step
@@ -1030,16 +1047,50 @@ class Ground(nn.Module):
                                         background_rgb=None,
                                         cos_anneal_ratio=self.get_cos_anneal_ratio(),
                                         camera_encod=camera_encod.reshape(-1))
-        
+        render_out['gt_rgb'] = gt_rgb
+        rgb_full = torch.zeros_like(image_infos['pixels'])
+        rgb_full[mask == 1] = render_out['color_fine']
+        render_out['rgb_full'] = rgb_full
         self.iter_step += 1
         return render_out
     def get_loss(self, render_out, image_infos, camera_infos):
-        true_rgb = image_infos['pixels']
-        H, W, _ = true_rgb.shape
-        mask = torch.zeros_like(true_rgb[:, :, 0])
-        mask[int(H / 2):, :] = 1
-        # gt_seg = data['seg'].to(self.device)
-        image_batch_size, batch_size = H, W
+        """
+        image_infos: {
+            'origins': torch.Tensor, [900 / d, 1600 / d, 3]. 都是同一个origin
+            'viewdirs': torch.Tensor, [900 / d, 1600 / d, 3]. 
+            'direction_norm': torch.Tensor, [900 / d, 1600 / d, 1]. ???
+            'pixel_coords': torch.Tensor, [900 / d, 1600 / d, 2]. normalized pixel coordinates
+            'normed_time': torch.Tensor, [900 / d, 1600 / d]. normalized time. 猜测是整个bag的时间戳在0-1之间的归一化
+            'img_idx': torch.Tensor, [900 / d, 1600 / d]. 
+            'frame_idx': torch.Tensor, [900 / d, 1600 / d].
+            'pixels': torch.Tensor, [900 / d, 1600 / d, 3]. RGB
+            'sky_masks': torch.Tensor, [900 / d, 1600 / d]. 估计1代表天空
+            'dynamic_masks': torch.Tensor, [900 / d, 1600 / d]. 
+            'human_masks': torch.Tensor, [900 / d, 1600 / d].
+            'vehicle_masks': torch.Tensor, [900 / d, 1600 / d].
+            'lidar_depth_map': torch.Tensor, [900 / d, 1600 / d].
+        }
+        
+        camera_infos: {
+            'cam_id': torch.Tensor, [900 / d, 1600 / d].
+            'cam_name': str.
+            'camera_to_world': torch.Tensor, [4, 4]. #TODO: nuscenes相机高度从哪里来
+            'height': torch.Tensor, [1]. image height
+            'width': torch.Tensor, [1]. image width
+            'intrinsics': torch.Tensor, [3, 3].
+        }
+        
+        return rgb
+        """
+        true_rgb = render_out['gt_rgb']
+        B, _ = true_rgb.shape
+        
+        # mask = torch.ones([H, W], device=self.device)
+        # mask[image_infos['dynamic_masks'] == 1] = 0
+        # mask[image_infos['sky_masks'] == 1] = 0
+        # mask[:int(3 / 5 * H), :] = 0
+        # # gt_seg = data['seg'].to(self.device)
+        # image_batch_size, batch_size = H, W
         
 
         color_fine = render_out['color_fine']
@@ -1047,34 +1098,14 @@ class Ground(nn.Module):
         # label = render_out['label']
         delta_loss = render_out['delta_loss']
         delta_color = render_out['delta_color']
+        s_val = render_out['s_val']
         
         delta_color_loss = F.mse_loss(delta_color, torch.zeros_like(delta_color))
         
         
-        true_rgb = true_rgb.reshape(image_batch_size * batch_size, -1)
-        mask = mask.reshape(image_batch_size * batch_size, -1)
+        color_error = (color_fine - true_rgb)
+        color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='mean')
 
-
-        color_mask = (mask > 0).float()     # color loss only applied to road
-
-        mask_sum = color_mask.sum() + 1e-5
-        lumin_mask = (torch.mean(true_rgb, dim=-1) > 0.1).float()
-
-        color_mask *= lumin_mask.unsqueeze(-1)
-        
-        color_error = (color_fine - true_rgb) * color_mask
-
-        lumin_error = color_error[:, 0]
-
-        lumin_error = lumin_error * lumin_mask
-        color_error = color_error[:, 1:]
-        color_fine_loss = F.l1_loss(color_error, torch.zeros_like(color_error), reduction='sum') / mask_sum
-
-        
-        lumin_fine_loss = F.l1_loss(lumin_error, torch.zeros_like(lumin_error), reduction='sum') / ((color_mask.squeeze(-1) * lumin_mask).sum() + 1e-5)
-        color_fine_loss += lumin_fine_loss
-
-        psnr = 20.0 * torch.log10(1.0 / (((color_fine - true_rgb)**2 * color_mask).sum() / (mask_sum * 3.0)).sqrt())
         bev_to_world_factor = 9 ** 2 / 500 ** 2
         eikonal_loss = gradient_error * bev_to_world_factor
 
@@ -1085,6 +1116,9 @@ class Ground(nn.Module):
             delta_loss * 0
 
         loss += delta_color_loss * 0.05 * 10
+        
+        # s_val loss
+        loss += s_val.mean()
 
         return loss
     def backward(self, loss):

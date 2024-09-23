@@ -186,57 +186,55 @@ def main(args):
     # )
 
     for step in metric_logger.log_every(all_iters, cfg.logging.print_freq):
-        #----------------------------------------------------------------------------
-        #----------------------------     Validate     ------------------------------
-        # if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:
-        #     logger.info("Visualizing...")
-        #     vis_timestep = np.linspace(
-        #         0,
-        #         dataset.num_img_timesteps,
-        #         trainer.num_iters // cfg.logging.vis_freq + 1,
-        #         endpoint=False,
-        #         dtype=int,
-        #     )[step // cfg.logging.vis_freq]
-        #     # with torch.no_grad():
-        #     render_results = render_images(
-        #         trainer=trainer,
-        #         dataset=dataset.full_image_set,
-        #         compute_metrics=True,
-        #         compute_error_map=cfg.render.vis_error,
-        #         vis_indices=[
-        #             vis_timestep * dataset.pixel_source.num_cams + i
-        #             for i in range(dataset.pixel_source.num_cams)
-        #         ],
-        #     )
-        #     if args.enable_wandb:
-        #         wandb.log(
-        #             {
-        #                 "image_metrics/psnr": render_results["psnr"],
-        #                 "image_metrics/ssim": render_results["ssim"],
-        #                 "image_metrics/occupied_psnr": render_results["occupied_psnr"],
-        #                 "image_metrics/occupied_ssim": render_results["occupied_ssim"],
-        #             }
-        #         )
-        #     vis_frame_dict = save_videos(
-        #         render_results,
-        #         save_pth=os.path.join(
-        #             cfg.log_dir, "images", f"step_{step}.png"
-        #         ),  # don't save the video
-        #         layout=dataset.layout,
-        #         num_timestamps=1,
-        #         keys=render_keys,
-        #         save_seperate_video=cfg.logging.save_seperate_video,
-        #         num_cams=dataset.pixel_source.num_cams,
-        #         fps=cfg.render.fps,
-        #         verbose=False,
-        #     )
-        #     if args.enable_wandb:
-        #         for k, v in vis_frame_dict.items():
-        #             wandb.log({"image_rendering/" + k: wandb.Image(v)})
-        #     del render_results
-        #     torch.cuda.empty_cache()
-                
-        
+        # ----------------------------------------------------------------------------
+        # ----------------------------     Validate     ------------------------------
+        if step % cfg.logging.vis_freq == 0 and cfg.logging.vis_freq > 0:
+            logger.info("Visualizing...")
+            vis_timestep = np.linspace(
+                0,
+                dataset.num_img_timesteps,
+                trainer.num_iters // cfg.logging.vis_freq + 1,
+                endpoint=False,
+                dtype=int,
+            )[step // cfg.logging.vis_freq]
+            # with torch.no_grad():
+            render_results = render_images(
+                trainer=trainer,
+                dataset=dataset.full_image_set,
+                compute_metrics=True,
+                compute_error_map=cfg.render.vis_error,
+                vis_indices=[
+                    vis_timestep * dataset.pixel_source.num_cams + i
+                    for i in range(dataset.pixel_source.num_cams)
+                ],
+            )
+            if args.enable_wandb:
+                wandb.log(
+                    {
+                        "image_metrics/psnr": render_results["psnr"],
+                        "image_metrics/ssim": render_results["ssim"],
+                        "image_metrics/occupied_psnr": render_results["occupied_psnr"],
+                        "image_metrics/occupied_ssim": render_results["occupied_ssim"],
+                    }
+                )
+            vis_frame_dict = save_videos(
+                render_results,
+                save_pth=os.path.join(
+                    cfg.log_dir, "images", f"step_{step}.png"
+                ),  # don't save the video
+                layout=dataset.layout,
+                num_timestamps=1,
+                keys=render_keys,
+                save_seperate_video=cfg.logging.save_seperate_video,
+                num_cams=dataset.pixel_source.num_cams,
+                fps=cfg.render.fps,
+                verbose=False,
+            )
+            if args.enable_wandb:
+                for k, v in vis_frame_dict.items():
+                    wandb.log({"image_rendering/" + k: wandb.Image(v)})
+            del render_results
+            torch.cuda.empty_cache()
         #----------------------------------------------------------------------------
         #----------------------------  training step  -------------------------------
         # prepare for training

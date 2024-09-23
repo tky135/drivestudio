@@ -20,7 +20,7 @@ from models.video_utils import (
 logger = logging.getLogger()
 current_time = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime())
 
-@torch.no_grad()
+# @torch.no_grad()
 def do_evaluation(
     step: int = 0,
     cfg: OmegaConf = None,

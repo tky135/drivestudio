@@ -91,16 +91,17 @@ class MultiTrainer(BasicTrainer):
     ) -> None:
 
         # Ground network initialization
-        self.omnire_w2neus_w = self.models['Ground'].omnire_w2neus_w.to(dataset.pixel_source.camera_data[0].cam_to_worlds.device)
-        self.cam_0_to_neus_world = self.omnire_w2neus_w @ dataset.pixel_source.camera_data[0].cam_to_worlds
-        self.ego_points = self.cam_0_to_neus_world[:, :3, 3]
-        self.ego_points[:, 2] -= 1.51
-        self.ego_normals = self.cam_0_to_neus_world[:, :3, :3] @ torch.tensor([0, -1, 0]).type(torch.float32).to(self.cam_0_to_neus_world.device)
-        self.models['Ground'].ego_points = self.ego_points
-        self.models['Ground'].ego_normals = self.ego_normals
-        self.models['Ground'].pretrain_sdf()
-        
-        self.models['Ground'].validate_mesh()
+        if 'Ground' in self.models.keys():
+            self.omnire_w2neus_w = self.models['Ground'].omnire_w2neus_w.to(dataset.pixel_source.camera_data[0].cam_to_worlds.device)
+            self.cam_0_to_neus_world = self.omnire_w2neus_w @ dataset.pixel_source.camera_data[0].cam_to_worlds
+            self.ego_points = self.cam_0_to_neus_world[:, :3, 3]
+            self.ego_points[:, 2] -= 1.51
+            self.ego_normals = self.cam_0_to_neus_world[:, :3, :3] @ torch.tensor([0, -1, 0]).type(torch.float32).to(self.cam_0_to_neus_world.device)
+            self.models['Ground'].ego_points = self.ego_points
+            self.models['Ground'].ego_normals = self.ego_normals
+            self.models['Ground'].pretrain_sdf()
+            
+            self.models['Ground'].validate_mesh()
         # get instance points
         rigidnode_pts_dict, deformnode_pts_dict, smplnode_pts_dict = {}, {}, {}
         if "RigidNodes" in self.model_config:
@@ -296,21 +297,36 @@ class MultiTrainer(BasicTrainer):
             radius_clip=self.render_cfg.get('radius_clip', 0.)
         )
         
-        # render ground
-        ground_model = self.models['Ground']
-        rgb_ground = ground_model(image_infos, camera_infos)
-        outputs['ground'] = rgb_ground
         
         # render sky
         sky_model = self.models['Sky']
         outputs["rgb_sky"] = sky_model(image_infos)
         outputs["rgb_sky_blend"] = outputs["rgb_sky"] * (1.0 - outputs["opacity"])
         
-        # affine transformation # 对每个image_idx的rgb进行一次affine transform
-        outputs["rgb"] = self.affine_transformation(
-            outputs["rgb_gaussians"] + outputs["rgb_sky"] * (1.0 - outputs["opacity"]), image_infos
-        )
-        
+        if 'Ground' in self.models.keys():
+            # render ground
+            ground_model = self.models['Ground']
+            rgb_ground = ground_model(image_infos, camera_infos)
+            outputs['ground'] = rgb_ground
+            
+            # affine transformation # 对每个image_idx的rgb进行一次affine transform
+            outputs["rgb"] = self.affine_transformation(
+                outputs["rgb_gaussians"] + (rgb_ground['rgb_full'] + image_infos['sky_masks'].unsqueeze(-1) * outputs["rgb_sky"]) * (1.0 - outputs["opacity"]), image_infos
+            )
+            if self.models['Ground'].iter_step % 100 == 0:
+                with torch.no_grad():
+                    road_opacity_mean = outputs['opacity'][image_infos['road_masks'] == 1].mean()
+                    sky_opacity_mean = outputs['opacity'][image_infos['sky_masks'] == 1].mean()
+                    print(road_opacity_mean.item(), sky_opacity_mean.item())
+                
+                image_infos["gaussian_rgb"] = outputs["rgb"].detach()
+                self.models['Ground'].validate_image(image_infos, camera_infos)
+            if self.models['Ground'].iter_step % 1000 == 0:
+                self.models['Ground'].validate_mesh()
+        else:
+            outputs["rgb"] = self.affine_transformation(
+                outputs["rgb_gaussians"] + image_infos['sky_masks'].unsqueeze(-1) * outputs["rgb_sky"] * (1.0 - outputs["opacity"]), image_infos
+            )
         if not self.training and self.render_each_class:
             with torch.no_grad():
                 for class_name in self.gaussian_classes.keys():

@@ -193,7 +193,7 @@ class CameraData(object):
         # ---- define filepaths ---- #
         img_filepaths = []
         dynamic_mask_filepaths, sky_mask_filepaths = [], []
-        human_mask_filepaths, vehicle_mask_filepaths = [], []
+        human_mask_filepaths, vehicle_mask_filepaths, road_mask_filepaths = [], [], []
         
         fine_mask_path = os.path.join(self.data_path, "fine_dynamic_masks")
         if os.path.exists(fine_mask_path):
@@ -223,6 +223,11 @@ class CameraData(object):
                     self.data_path, dynamic_mask_dir, "vehicle", f"{t:03d}_{self.cam_id}.png"
                 )
             )
+            road_mask_filepaths.append(
+                os.path.join(
+                    self.data_path, dynamic_mask_dir, "road", f"{t:03d}_{self.cam_id}.png"
+                )
+            )
             sky_mask_filepaths.append(
                 os.path.join(self.data_path, "sky_masks", f"{t:03d}_{self.cam_id}.png")
             )
@@ -230,6 +235,7 @@ class CameraData(object):
         self.dynamic_mask_filepaths = np.array(dynamic_mask_filepaths)
         self.human_mask_filepaths = np.array(human_mask_filepaths)
         self.vehicle_mask_filepaths = np.array(vehicle_mask_filepaths)
+        self.road_mask_filepaths = np.array(road_mask_filepaths)
         self.sky_mask_filepaths = np.array(sky_mask_filepaths)
         
     def load_images(self):
@@ -350,6 +356,29 @@ class CameraData(object):
             vehicle_masks.append(np.array(vehicle_mask) > 0)
         self.vehicle_masks = torch.from_numpy(np.stack(vehicle_masks, axis=0)).float()
         
+        road_masks = []
+        for ix, fname in tqdm(
+            enumerate(self.road_mask_filepaths),
+            desc="Loading road masks",
+            dynamic_ncols=True,
+            total=len(self.road_mask_filepaths),
+        ):
+            road_mask = Image.open(fname).convert("L")
+            # resize them to the load_size
+            road_mask = road_mask.resize(
+                (self.load_size[1], self.load_size[0]), Image.BILINEAR
+            )
+            if self.undistort:
+                if ix == 0:
+                    print("undistorting road mask")
+                road_mask = cv2.undistort(
+                    np.array(road_mask),
+                    self.intrinsics[ix].numpy(),
+                    self.distortions[ix].numpy(),
+                )
+            road_masks.append(np.array(road_mask) > 0)
+        self.road_masks = torch.from_numpy(np.stack(road_masks, axis=0)).float()
+        
     def load_sky_masks(self):
         sky_masks = []
         for ix, fname in tqdm(
@@ -467,6 +496,8 @@ class CameraData(object):
             self.human_masks = self.human_masks.to(device)
         if self.vehicle_masks is not None:
             self.vehicle_masks = self.vehicle_masks.to(device)
+        if self.road_masks is not None:
+            self.road_masks = self.road_masks.to(device)
         if self.sky_masks is not None:
             self.sky_masks = self.sky_masks.to(device)
         if self.lidar_depth_maps is not None:
@@ -577,7 +608,18 @@ class CameraData(object):
                     .squeeze(0)
                     .squeeze(0)
                 )
-            
+        if self.road_masks is not None:
+            road_mask = self.road_masks[frame_idx]
+            if self.downscale_factor != 1.0:
+                road_mask = (
+                    torch.nn.functional.interpolate(
+                        road_mask.unsqueeze(0).unsqueeze(0),
+                        scale_factor=self.downscale_factor,
+                        mode="nearest",
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
         lidar_depth_map = None
         if self.lidar_depth_maps is not None:
             lidar_depth_map = self.lidar_depth_maps[frame_idx]
@@ -641,6 +683,7 @@ class CameraData(object):
             "dynamic_masks": dynamic_mask,
             "human_masks": human_mask,
             "vehicle_masks": vehicle_mask,
+            "road_masks": road_mask,
             "egocar_masks": egocar_mask,
             "lidar_depth_map": lidar_depth_map,
         }

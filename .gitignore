@@ -189,4 +189,5 @@ local_scripts
 tkyout
 SMPL_*
 segformer.*.pth 
-neus_ground
+neus_ground*
+*_*cams*/

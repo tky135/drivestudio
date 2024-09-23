@@ -18,7 +18,7 @@ data:
   pixel_source: # image source and object annotations
     type: datasets.nuscenes.nuscenes_sourceloader.NuScenesPixelSource
     cameras: [0, 1, 2, 3, 4, 5] # which cameras to use
-    downscale_when_loading: [3, 3, 3, 3, 3, 3] # the size of the images to load
+    downscale_when_loading: [4, 4, 4, 4, 4, 4] # the size of the images to load
     downscale: 1 # downscale factor wrt to the downscale_when_loading
     undistort: False # whether to undistort the images
     test_image_stride: 0 # use every Nth timestep for the test set. if 0, use all images for training and none for testing

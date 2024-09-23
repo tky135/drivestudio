@@ -135,8 +135,9 @@ class BasicTrainer(nn.Module):
         self.train()
     
     def set_eval(self):
-        for model in self.models.values():
-            model.eval()
+        for model_name, model in self.models.items():
+            if model_name != "Ground":
+                model.eval()
         self.eval()
 
     def _get_downscale_factor(self):
@@ -277,6 +278,8 @@ class BasicTrainer(nn.Module):
             self.tic = time.time()
         
     def postprocess_per_train_step(self, step: int) -> None:
+        if 'Ground' in self.models and self.models['Ground'].iter_step <= 2000:
+            return
         radii = self.info["radii"]
         if self.render_cfg.absgrad:
             grads = self.info["means2d"].absgrad.clone()
@@ -523,104 +526,105 @@ class BasicTrainer(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         # calculate loss
         loss_dict = {}
-        ground_loss = self.models['Ground'].get_loss(outputs['ground'], image_infos, cam_infos)
-        print("Ground loss", ground_loss)
-        loss_dict.update({
-            "ground_loss": ground_loss
-        })
-        if "egocar_masks" in image_infos:
-            # in the case of egocar, we need to mask out the egocar region
-            valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float()
-        else:
-            valid_loss_mask = torch.ones_like(image_infos["sky_masks"])
-            
-        gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]
-        predicted_rgb = outputs["rgb"] * valid_loss_mask[..., None]
-        
-        gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float() * valid_loss_mask
-        pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask
-        
-        # rgb loss
-        Ll1 = torch.abs(gt_rgb - predicted_rgb).mean()
-        simloss = 1 - self.ssim(gt_rgb.permute(2, 0, 1)[None, ...], predicted_rgb.permute(2, 0, 1)[None, ...])
-        loss_dict.update({
-            "rgb_loss": self.losses_dict.rgb.w * Ll1,
-            "ssim_loss": self.losses_dict.ssim.w * simloss,
-        })
-        
-        # mask loss
-        if self.sky_opacity_loss_fn is not None:
-            sky_loss_opacity = self.sky_opacity_loss_fn(pred_occupied_mask, gt_occupied_mask) * self.losses_dict.mask.w
-            loss_dict.update({"sky_loss_opacity": sky_loss_opacity})
-        
-        # depth loss
-        if self.depth_loss_fn is not None:
-            gt_depth = image_infos["lidar_depth_map"] 
-            lidar_hit_mask = (gt_depth > 0).float() * valid_loss_mask
-            pred_depth = outputs["depth"]
-            depth_loss = self.depth_loss_fn(pred_depth, gt_depth, lidar_hit_mask)
-            
-            lidar_w_decay = self.losses_dict.depth.get("lidar_w_decay", -1)
-            if lidar_w_decay > 0:
-                decay_weight = np.exp(-self.step / 8000 * lidar_w_decay)
+        if 'Ground' in self.models:
+            ground_loss = self.models['Ground'].get_loss(outputs['ground'], image_infos, cam_infos)
+            loss_dict.update({
+                "ground_loss": ground_loss
+            })
+        if 'Ground' in self.models and self.models['Ground'].iter_step > 2000:
+            if "egocar_masks" in image_infos:
+                # in the case of egocar, we need to mask out the egocar region
+                valid_loss_mask = (1.0 - image_infos["egocar_masks"]).float() * (1.0 - image_infos["road_masks"]).float()
             else:
-                decay_weight = 1
-            depth_loss = depth_loss * self.losses_dict.depth.w * decay_weight
-            loss_dict.update({"depth_loss": depth_loss})
+                valid_loss_mask = torch.ones_like(image_infos["sky_masks"])
+            # valid_loss_mask *= (1.0 - image_infos['road_masks']).float()
+            gt_rgb = image_infos["pixels"] * valid_loss_mask[..., None]
+            predicted_rgb = outputs["rgb"] * valid_loss_mask[..., None]
             
-        # ----- reg loss -----
-        opacity_entropy_reg = self.losses_dict.get("opacity_entropy", None)
-        if opacity_entropy_reg is not None:
-            pred_opacity = torch.clamp(outputs["opacity"].squeeze(), 1e-6, 1 - 1e-6)
+            gt_occupied_mask = (1.0 - image_infos["sky_masks"]).float() * valid_loss_mask# * (1.0 - image_infos["road_masks"]).float()
+            pred_occupied_mask = outputs["opacity"].squeeze() * valid_loss_mask
+            
+            # rgb loss
+            Ll1 = torch.abs(gt_rgb - predicted_rgb).mean()
+            simloss = 1 - self.ssim(gt_rgb.permute(2, 0, 1)[None, ...], predicted_rgb.permute(2, 0, 1)[None, ...])
             loss_dict.update({
-                "opacity_entropy_loss": opacity_entropy_reg.w * (-pred_opacity * torch.log(pred_opacity)).mean()
+                "rgb_loss": self.losses_dict.rgb.w * Ll1,
+                "ssim_loss": self.losses_dict.ssim.w * simloss,
             })
             
-        # from pvg: https://github.com/fudan-zvg/PVG/blob/b4162a9135282e0f3c929054f16be1b3fbacd77a/train.py#L161
-        inverse_depth_smoothness_reg = self.losses_dict.get("inverse_depth_smoothness", None)
-        if inverse_depth_smoothness_reg is not None:
-            inverse_depth = 1 / (outputs["depth"] + 1e-5)
-            loss_inv_depth = kornia.losses.inverse_depth_smoothness_loss(
-                inverse_depth[None].repeat(1, 1, 1, 3).permute(0, 3, 1, 2),
-                image_infos["pixels"][None].permute(0, 3, 1, 2)
-            )
-            loss_dict.update({
-                "inverse_depth_smoothness_loss": inverse_depth_smoothness_reg.w * loss_inv_depth
-            })
+            # # mask loss
+            # if self.sky_opacity_loss_fn is not None:
+            #     sky_loss_opacity = self.sky_opacity_loss_fn(pred_occupied_mask, gt_occupied_mask) * self.losses_dict.mask.w
+            #     loss_dict.update({"sky_loss_opacity": sky_loss_opacity})
             
-        # affine reg loss
-        affine_reg = self.losses_dict.get("affine", None)
-        if affine_reg is not None and "Affine" in self.models:
-            affine_trs = self.models['Affine']({"img_idx": image_infos["img_idx"].flatten()[0]})
-            reg_mat = torch.eye(3, device=self.device)
-            reg_shift = torch.zeros(3, device=self.device)
-            loss_affine = torch.abs(affine_trs[..., :3, :3] - reg_mat).mean() + torch.abs(affine_trs[..., :3, 3:] - reg_shift).mean()
-            loss_dict.update({
-                "affine_loss": affine_reg.w * loss_affine
-            })
-
-        # dynamic region loss
-        dynamic_region_weighted_losses = self.losses_dict.get("dynamic_region", None)
-        if dynamic_region_weighted_losses is not None:
-            weight_factor = dynamic_region_weighted_losses.get("w", 1.0)
-            start_from = dynamic_region_weighted_losses.get("start_from", 0)
-            if self.step == start_from:
-                self.render_dynamic_mask = True
-            if self.step > start_from and "Dynamic_opacity" in outputs:
-                dynamic_pred_mask = (outputs["Dynamic_opacity"].data > 0.2).squeeze()
-                dynamic_pred_mask = dynamic_pred_mask & valid_loss_mask.bool()
+            # # depth loss
+            # if self.depth_loss_fn is not None:
+            #     gt_depth = image_infos["lidar_depth_map"] 
+            #     lidar_hit_mask = (gt_depth > 0).float() * valid_loss_mask
+            #     pred_depth = outputs["depth"]
+            #     depth_loss = self.depth_loss_fn(pred_depth, gt_depth, lidar_hit_mask)
                 
-                if dynamic_pred_mask.sum() > 0:
-                    Ll1 = torch.abs(gt_rgb[dynamic_pred_mask] - predicted_rgb[dynamic_pred_mask]).mean()
-                    loss_dict.update({
-                        "vehicle_region_rgb_loss": weight_factor * Ll1,
-                    })
-            
-        # compute gaussian reg loss
-        for class_name in self.gaussian_classes.keys():
-            class_reg_loss = self.models[class_name].compute_reg_loss()
-            for k, v in class_reg_loss.items():
-                loss_dict[f"{class_name}_{k}"] = v
+            #     lidar_w_decay = self.losses_dict.depth.get("lidar_w_decay", -1)
+            #     if lidar_w_decay > 0:
+            #         decay_weight = np.exp(-self.step / 8000 * lidar_w_decay)
+            #     else:
+            #         decay_weight = 1
+            #     depth_loss = depth_loss * self.losses_dict.depth.w * decay_weight
+            #     loss_dict.update({"depth_loss": depth_loss})
+                
+            # # ----- reg loss -----
+            # opacity_entropy_reg = self.losses_dict.get("opacity_entropy", None)
+            # if opacity_entropy_reg is not None:
+            #     pred_opacity = torch.clamp(outputs["opacity"].squeeze(), 1e-6, 1 - 1e-6)
+            #     loss_dict.update({
+            #         "opacity_entropy_loss": opacity_entropy_reg.w * (-pred_opacity * torch.log(pred_opacity)).mean()
+            #     })
+                
+            # # from pvg: https://github.com/fudan-zvg/PVG/blob/b4162a9135282e0f3c929054f16be1b3fbacd77a/train.py#L161
+            # inverse_depth_smoothness_reg = self.losses_dict.get("inverse_depth_smoothness", None)
+            # if inverse_depth_smoothness_reg is not None:
+            #     inverse_depth = 1 / (outputs["depth"] + 1e-5)
+            #     loss_inv_depth = kornia.losses.inverse_depth_smoothness_loss(
+            #         inverse_depth[None].repeat(1, 1, 1, 3).permute(0, 3, 1, 2),
+            #         image_infos["pixels"][None].permute(0, 3, 1, 2)
+            #     )
+            #     loss_dict.update({
+            #         "inverse_depth_smoothness_loss": inverse_depth_smoothness_reg.w * loss_inv_depth
+            #     })
+                
+            # # affine reg loss
+            # affine_reg = self.losses_dict.get("affine", None)
+            # if affine_reg is not None and "Affine" in self.models:
+            #     affine_trs = self.models['Affine']({"img_idx": image_infos["img_idx"].flatten()[0]})
+            #     reg_mat = torch.eye(3, device=self.device)
+            #     reg_shift = torch.zeros(3, device=self.device)
+            #     loss_affine = torch.abs(affine_trs[..., :3, :3] - reg_mat).mean() + torch.abs(affine_trs[..., :3, 3:] - reg_shift).mean()
+            #     loss_dict.update({
+            #         "affine_loss": affine_reg.w * loss_affine
+            #     })
+
+            # # dynamic region loss
+            # dynamic_region_weighted_losses = self.losses_dict.get("dynamic_region", None)
+            # if dynamic_region_weighted_losses is not None:
+            #     weight_factor = dynamic_region_weighted_losses.get("w", 1.0)
+            #     start_from = dynamic_region_weighted_losses.get("start_from", 0)
+            #     if self.step == start_from:
+            #         self.render_dynamic_mask = True
+            #     if self.step > start_from and "Dynamic_opacity" in outputs:
+            #         dynamic_pred_mask = (outputs["Dynamic_opacity"].data > 0.2).squeeze()
+            #         dynamic_pred_mask = dynamic_pred_mask & valid_loss_mask.bool()
+                    
+            #         if dynamic_pred_mask.sum() > 0:
+            #             Ll1 = torch.abs(gt_rgb[dynamic_pred_mask] - predicted_rgb[dynamic_pred_mask]).mean()
+            #             loss_dict.update({
+            #                 "vehicle_region_rgb_loss": weight_factor * Ll1,
+            #             })
+                
+            # # compute gaussian reg loss
+            # for class_name in self.gaussian_classes.keys():
+            #     class_reg_loss = self.models[class_name].compute_reg_loss()
+            #     for k, v in class_reg_loss.items():
+            #         loss_dict[f"{class_name}_{k}"] = v
         return loss_dict
     
     def compute_metrics(

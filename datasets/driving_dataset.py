@@ -673,6 +673,8 @@ class DrivingDataset(SceneDataset):
                 
                 depth = lidar_points[:, 2]
                 cam_points = lidar_points[:, :2] / (depth.unsqueeze(-1) + 1e-6) # (num_pts, 2)
+                road_mask = cam.road_masks[frame_idx].to(cam_points.device)
+
                 valid_mask = (
                     (cam_points[:, 0] >= 0)
                     & (cam_points[:, 0] < cam.WIDTH)
@@ -680,6 +682,12 @@ class DrivingDataset(SceneDataset):
                     & (cam_points[:, 1] < cam.HEIGHT)
                     & (depth > 0)
                 ) # (num_pts, )
+                
+                off_road_mask_in_valid = road_mask[cam_points[valid_mask, 1].long(), cam_points[valid_mask, 0].long()] == 0
+                valid_mask_clone = valid_mask.clone()
+                valid_mask_clone[valid_mask] = off_road_mask_in_valid
+                valid_mask = valid_mask_clone
+                
                 depth = depth[valid_mask]
                 _cam_points = cam_points[valid_mask]
                 depth_map = torch.zeros(
